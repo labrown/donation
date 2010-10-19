@@ -195,7 +195,7 @@ function donation_civicrm_postProcess(&$formName, &$form) {
 	 is_array( $form->_paymentProcessor ) &&
 	 $total > 0.0 ) {            
       // default mode is direct
-      $form->set( 'contributeMode', 'direct' ); 
+      $form->set( 'contributeMode', 'notify' ); 
     }    
   }
 }
