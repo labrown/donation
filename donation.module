@@ -1,0 +1,290 @@
+<?php
+
+ini_set("log_errors", 1);
+ini_set("error_log", "/var/tmp/php-error.log");
+
+/**
+* @file
+* Donation module for ISBA. This module should be used together with a
+* patch to CiviCRM.
+* Yi Zhang. yizhang84@gmail.com
+* Aug 02, 2009.
+*/
+
+/* Provide a shortcut to view user's contact record. Will be accessed
+ by path '/profile'.
+ */
+function donation_menu() {
+  $items = array();
+  $items['profile'] = array(
+			    'title' => t('My Profile'),
+			    'page callback' => 'donation_redirect_profile',
+			    'type' => MENU_NORMAL_ITEM,
+			    'access callback' => true
+			    );
+  return $items;
+}
+
+function donation_redirect_profile() {
+  global $user;
+  civicrm_initialize( );
+  require_once "CRM/Core/Session.php";
+  $session =& CRM_Core_Session::singleton( );
+  $uid = $session->get( 'userID' ); 
+  drupal_goto('civicrm/contact/view','cid='.$uid);
+}
+
+
+
+/* This hook gets called after civicrm writes an object in DB.
+ Itemize the contribution record and delete the unitemized record.
+*/
+function donation_civicrm_post($op, $objName, $objId, &$obj) {
+  require_once "CRM/Core/Session.php";
+  $session =& CRM_Core_Session::singleton( );
+  if ($session->get('multcontrib') && ($objName == 'Contribution') && $op == 'create' && $obj->contribution_type_id==1) {
+    // retrieve the record from DB
+    require_once "CRM/Contribute/BAO/Contribution.php";
+    require_once "CRM/Contribute/BAO/ContributionType.php";
+    $now = date( 'YmdHis' );    
+    $params = array("id"=>$objId);
+    $ids = array();
+    $defaults = array();
+    $contrib = CRM_Contribute_BAO_Contribution::retrieve($params, $defaults, $ids);
+    //error_log(print_r($defaults, true));
+    $amounts = $session->get('contrib_amounts');
+    // insert itemized records
+    $trxn_id = array_key_exists('trxn_id',$defaults)? $defaults['trxn_id'] : null;
+    error_log($trxn_id);
+    foreach( $amounts as $k => $v) {
+      $par = array("name" => $k);
+      $def = array();
+      $found = CRM_Contribute_BAO_ContributionType::retrieve($par, $def);
+      $defaults['contribution_type_id'] = $found->id;
+      $defaults['total_amount'] = $v;
+      if (array_key_exists('invoice_id', $defaults))
+	$defaults['invoice_id'] =  md5(uniqid(rand(), true));
+      if ($trxn_id)
+	$defaults['trxn_id'] = $trxn_id . '-' . $k;
+      $newIds = array();
+      $new = CRM_Contribute_BAO_Contribution::create($defaults, $newIds);
+      // If online transaction, add financial trxn record
+      if ($trxn_id) {
+      $trxnParams = array(
+			  'contribution_id'   => $new->id,
+			  'trxn_date'         => $now,
+			  'trxn_type'         => 'Debit',
+			  'total_amount'      => $new->total_amount,
+			  'fee_amount'        => $new->fee_amount,
+			  'net_amount'        => $new->net_amount? $new->net_amount: $new->total_amount ,
+			  'currency'          => $new->currency,
+			  'payment_processor' => $session->get('payment_processor_type'),
+			  'trxn_id'           => $new->trxn_id,
+			  );
+            
+      require_once 'CRM/Contribute/BAO/FinancialTrxn.php';
+      $trxn =& CRM_Contribute_BAO_FinancialTrxn::create( $trxnParams );
+      }
+      //error_log(print_r($new, true));
+    }
+    // delete the original record
+    CRM_Contribute_BAO_Contribution::deleteContribution($ids['contribution']);
+  }
+}
+
+
+function str_begins_with($str, $search) {
+  return (strncmp($str, $search, strlen($search)) == 0);
+}
+
+function mark_multcontrib($b) {
+  require_once "CRM/Core/Session.php";
+  $session =& CRM_Core_Session::singleton( );
+  if ($b)
+    $session->set('multcontrib', 1);
+  else {
+    $session->set('multcontrib', null);
+    $session->set('contrib_amounts', null);
+  }
+}
+
+/* This hook gets called when a form is built. We inject the itemized
+ donation entry fields into the Contribution_Main form, and set up
+ variables for the other Contribution forms.
+*/
+function donation_civicrm_buildForm($formName, &$form) {
+  if ($formName == 'CRM_Contribute_Form_Contribution_Main' &&
+      $form->getVar('_id')==1) {
+    $items = array();
+    $items_label = array("Grave"=>"Maintenance of Bayes' Grave",
+			 "Travel"=>"Young Researchers' Travel Fund",
+			 "Pilar"=>"Pilar Iglesias Memorial Fund",
+			 "DeGroot"=>"DeGroot Prize",
+			 "Lindley"=>"Lindley Prize",
+			 "Mitchell"=>"Mitchell Prize",
+			 "Savage"=>"Savage Award");
+    $form->assign('itemize',true);
+    foreach ($items_label as $k=>$v) {
+      $form->add('text', $k, $v);
+      $form->addRule($k,ts('Enter a monetary value.'), 'money'); 
+    }
+    //$form->assign('is_allow_other_amount',false);
+    $form->addFormRule('validate_items', $form);
+    //$form->getElement('amount_other')->setValue('1.0');
+    //$form->registerRule('validate_items','function','validate_items');
+    //$form->addRule('Grave', ts('Please fill at least one entry.'),
+    //'validate_items', array_keys($items_label));
+    require_once "CRM/Core/Session.php";
+    $session =& CRM_Core_Session::singleton( );
+    $session->set('multcontrib', 1);
+    $session->set('contrib_amounts', null);
+    $session->set('payment_processor_type', $form->_paymentProcessor['payment_processor_type']);
+  }
+
+  if ($formName == 'CRM_Contribute_Form_Contribution_Confirm' &&
+      $form->getVar('_id')==1) {
+    $form->assign('contrib_amounts',$form->get('contrib_amounts'));
+    mark_multcontrib(true);
+  }
+
+  if ($formName == 'CRM_Contribute_Form_Contribution_ThankYou' &&
+      $form->getVar('_id')==1) {
+    $form->assign('contrib_amounts',$form->get('contrib_amounts'));
+    mark_multcontrib(false);
+  }
+
+  if (str_begins_with($formName, 'CRM_Contribute_Form_Contribution') &&
+      $form->getVar('_id')!=1) {
+    mark_multcontrib(false);
+  }
+}
+
+/* Calculates the total amount of donation.
+ */
+function calcAmounts(&$form, &$total, &$amounts) {
+  $items_label = array("Grave","Travel","Pilar","DeGroot","Lindley","Mitchell","Savage");
+  $allempty = true;
+  foreach ($items_label as $v) {
+    if (trim($form->getSubmitValue($v))) {
+      $allempty = false;
+      $amounts[$v] = (float)$form->getSubmitValue($v);
+    }
+  }
+  $total = array_sum($amounts);
+  return $allempty;
+}
+
+/* This hook gets called after a form has been processed. Itemized
+ donations are collected and stored in session.
+*/
+function donation_civicrm_postProcess(&$formName, &$form) {
+  if ($formName == 'CRM_Contribute_Form_Contribution_Main' &&
+      $form->getVar('_id')==1) {
+    $total = 0.0;
+    $amounts = array();
+    calcAmounts($form, $total, $amounts);
+    $form->set('amount',$total);
+    $form->set('contrib_amounts', $amounts);
+    // store in session
+    $session =& CRM_Core_Session::singleton( );
+    $session->set('contrib_amounts', $amounts);
+    
+
+    // required only if is_monetary and valid postive amount 
+    if ( $form->_values['is_monetary'] &&
+	 is_array( $form->_paymentProcessor ) &&
+	 $total > 0.0 ) {            
+      // default mode is direct
+      $form->set( 'contributeMode', 'direct' ); 
+    }    
+  }
+}
+
+/* Validates the Contribution_Main form. Make sure at least one entry
+ * is filled.
+ */ 
+function validate_items(&$fields, &$files, &$form) {
+  $errors = array();
+  $items_label = array("Grave","Travel","Pilar","DeGroot","Lindley","Mitchell","Savage");
+  $amounts = array();
+  $allempty = true;
+  foreach ($items_label as $v) {
+    if ( trim($fields[$v])) {
+      $allempty = false;
+      $amounts[$v] = (float)$fields[$v];
+    }
+  }
+  $total = array_sum($amounts);
+
+  if ($allempty)
+    $errors['Grave'] = ts('Please fill at least one entry.');
+
+  require_once "CRM/Utils/Array.php";
+  // return if paylater mode
+  if ( CRM_Utils_Array::value( 'is_pay_later', $fields ) ) {
+    return empty( $errors ) ? true : $errors;
+  }
+        
+  // make sure all required fileds (credit card etc) are present
+
+  foreach ( $form->_fields as $name => $fld ) {
+    if ( $fld['is_required'] &&
+	 CRM_Utils_System::isNull( CRM_Utils_Array::value( $name, $fields ) ) ) {
+      $errors[$name] = ts( '%1 is a required field.', array( 1 => $fld['title'] ) );
+    }
+  }
+
+  // make sure that credit card number and cvv are valid
+  require_once 'CRM/Utils/Rule.php';
+  if ( CRM_Utils_Array::value( 'credit_card_type', $fields ) ) {
+    if ( CRM_Utils_Array::value( 'credit_card_number', $fields ) &&
+	 ! CRM_Utils_Rule::creditCardNumber( $fields['credit_card_number'], $fields['credit_card_type'] ) ) {
+      $errors['credit_card_number'] = ts( "Please enter a valid Credit Card Number" );
+    }
+    
+    if ( CRM_Utils_Array::value( 'cvv2', $fields ) &&
+	 ! CRM_Utils_Rule::cvv( $fields['cvv2'], $fields['credit_card_type'] ) ) {
+      $errors['cvv2'] =  ts( "Please enter a valid Credit Card Verification Number" );
+    }
+  }
+
+  $form->set('amounts',$amounts);
+  return empty( $errors ) ? true : $errors;
+}
+
+/*
+function donation_civicrm_validate1($formName, &$fields, &$files, &$form)
+{
+  $errors = array();
+  $allempty = true;
+  $total = 0.0;
+  if ($formName != 'CRM_Contribute_Form_Contribution_Main' ||
+      $form->getVar('_id')!=1) 
+    return true;
+
+  $items_label = array("Grave","Travel","Pilar","DeGroot","Lindley","Mitchell","Savage");
+  $items = array();
+  foreach($items_label as $l) {
+    $v = CRM_Utils_Array::value($l,$fields);
+    if ($v) {
+      $allempty = false;
+      //if (preg_match('/^[0-9]*\.?[0-9]+$/',$v)) {
+      require_once "CRM/Utils/Rule.php";
+      if (CRM_Utils_Rule::money($v)) {
+	$items[$l] = round((float)$v, 2);
+	$total = $total + $items[$l];
+      }
+      else {
+	$errors[$l] = ts('Amount for %1 is not a valid monetary value', array(1=>$l));
+      }
+    }
+  }
+  if ($allempty)
+    $errors['Grave'] = ts('Please fill at least one entry');
+  if (empty($errors)) {
+    $form->assign('amounts',$items);
+    return false;
+  }
+  return  $errors;
+}
+*/

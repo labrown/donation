@@ -1,0 +1,8 @@
+; $Id$
+
+name = Donation
+description = Enables multiple donations on one page
+package = ISBA
+version = "6.x"
+core = 6.x
+php = 5.2
